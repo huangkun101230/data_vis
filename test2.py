@@ -397,7 +397,7 @@ if __name__ == '__main__':
     test_loader = DataLoader(test_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=False)
 
     print("Building model...")
-    model = ComplexLSTM(SEQUENCE_LENGTH, lstm_units=CONFIG['LSTM_UNITS'], dropout_rate=CONFIG['DROPOUT_RATE'])
+    model = SimpleRNNDepth(in_channels=3, hidden_size=128)
     print(model)
 
     try:
