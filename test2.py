@@ -9,7 +9,47 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLRO
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import warnings
+import os
 warnings.filterwarnings('ignore')
+
+# GPU Configuration and Error Handling
+def configure_tensorflow():
+    """Configure TensorFlow for optimal performance and handle GPU issues"""
+    try:
+        # Check for GPU availability
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            print(f"Found {len(gpus)} GPU(s): {[gpu.name for gpu in gpus]}")
+            try:
+                # Try to configure GPU memory growth
+                for gpu in gpus:
+                    tf.config.experimental.set_memory_growth(gpu, True)
+                print("GPU memory growth configured successfully")
+                
+                # Set mixed precision for better performance
+                tf.keras.mixed_precision.set_global_policy('mixed_float16')
+                print("Mixed precision enabled for faster training")
+                return True
+                
+            except Exception as gpu_error:
+                print(f"GPU configuration failed: {gpu_error}")
+                print("Falling back to CPU execution...")
+                # Force CPU execution
+                tf.config.set_visible_devices([], 'GPU')
+                return False
+        else:
+            print("No GPU found, using CPU")
+            return False
+            
+    except Exception as e:
+        print(f"TensorFlow configuration error: {e}")
+        print("Using default CPU configuration")
+        # Force CPU execution as fallback
+        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+        return False
+
+# Configure TensorFlow before setting seeds
+gpu_available = configure_tensorflow()
 
 # Set random seeds for reproducibility
 np.random.seed(42)
@@ -123,61 +163,90 @@ def prepare_sequences(data, sequence_length):
     
     return np.array(sequences), np.array(targets)
 
-def build_complex_lstm_model(sequence_length, lstm_units=128, dropout_rate=0.3):
-    """Build a more complex LSTM model with regularization"""
-    model = Sequential([
-        # First LSTM layer with more units
-        LSTM(lstm_units, 
-             return_sequences=True, 
-             input_shape=(sequence_length, 1),
-             activation='tanh',
-             recurrent_activation='sigmoid'),
-        BatchNormalization(),
-        Dropout(dropout_rate),
-        
-        # Second LSTM layer
-        LSTM(lstm_units // 2, 
-             return_sequences=True,
-             activation='tanh',
-             recurrent_activation='sigmoid'),
-        BatchNormalization(),
-        Dropout(dropout_rate),
-        
-        # Third LSTM layer
-        LSTM(lstm_units // 4, 
-             return_sequences=False,
-             activation='tanh',
-             recurrent_activation='sigmoid'),
-        BatchNormalization(),
-        Dropout(dropout_rate),
-        
-        # Dense layers with regularization
-        Dense(64, activation='relu'),
-        BatchNormalization(),
-        Dropout(dropout_rate),
-        
-        Dense(32, activation='relu'),
-        Dropout(dropout_rate / 2),
-        
-        Dense(16, activation='relu'),
-        Dense(1)
-    ])
+def build_complex_lstm_model(sequence_length, lstm_units=128, dropout_rate=0.3, use_cpu_fallback=False):
+    """Build a more complex LSTM model with regularization and error handling"""
     
-    # Use a more sophisticated optimizer with learning rate scheduling
-    optimizer = Adam(
-        learning_rate=0.001,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-07
-    )
+    # If GPU failed, use smaller model for CPU training
+    if use_cpu_fallback or not gpu_available:
+        print("Using CPU-optimized model configuration...")
+        lstm_units = min(lstm_units, 64)  # Reduce complexity for CPU
+        dropout_rate = min(dropout_rate, 0.2)  # Reduce dropout
     
-    model.compile(
-        optimizer=optimizer,
-        loss='huber',  # More robust to outliers than MSE
-        metrics=['mae', 'mse']
-    )
-    
-    return model
+    try:
+        with tf.device('/CPU:0' if use_cpu_fallback else '/GPU:0' if gpu_available else '/CPU:0'):
+            model = Sequential([
+                # First LSTM layer with more units
+                LSTM(lstm_units, 
+                     return_sequences=True, 
+                     input_shape=(sequence_length, 1),
+                     activation='tanh',
+                     recurrent_activation='sigmoid',
+                     dropout=dropout_rate,
+                     recurrent_dropout=dropout_rate),
+                BatchNormalization(),
+                
+                # Second LSTM layer
+                LSTM(lstm_units // 2, 
+                     return_sequences=True,
+                     activation='tanh',
+                     recurrent_activation='sigmoid',
+                     dropout=dropout_rate,
+                     recurrent_dropout=dropout_rate),
+                BatchNormalization(),
+                
+                # Third LSTM layer
+                LSTM(lstm_units // 4, 
+                     return_sequences=False,
+                     activation='tanh',
+                     recurrent_activation='sigmoid',
+                     dropout=dropout_rate),
+                BatchNormalization(),
+                
+                # Dense layers with regularization
+                Dense(64, activation='relu'),
+                Dropout(dropout_rate),
+                
+                Dense(32, activation='relu'),
+                Dropout(dropout_rate / 2),
+                
+                Dense(16, activation='relu'),
+                Dense(1, dtype='float32')  # Ensure float32 output
+            ])
+            
+            # Use a more sophisticated optimizer with learning rate scheduling
+            optimizer = Adam(
+                learning_rate=0.001,
+                beta_1=0.9,
+                beta_2=0.999,
+                epsilon=1e-07
+            )
+            
+            model.compile(
+                optimizer=optimizer,
+                loss='huber',  # More robust to outliers than MSE
+                metrics=['mae', 'mse']
+            )
+            
+            return model
+            
+    except Exception as e:
+        print(f"Error building model: {e}")
+        print("Trying fallback model configuration...")
+        
+        # Simple fallback model
+        model = Sequential([
+            LSTM(32, input_shape=(sequence_length, 1)),
+            Dense(16, activation='relu'),
+            Dense(1)
+        ])
+        
+        model.compile(
+            optimizer='adam',
+            loss='mse',
+            metrics=['mae']
+        )
+        
+        return model
 
 def plot_results(actual, predicted, title="Electricity Consumption Forecast"):
     """Plot actual vs predicted values"""
@@ -242,16 +311,16 @@ def analyze_input_output_recommendations():
     
     return recommendations
 
-# Configuration options - easily adjustable
+# Configuration options - adjusted for stability
 CONFIG = {
     'INPUT_WEEKS': 4,      # How many weeks of historical data to use
     'OUTPUT_WEEKS': 1,     # How many weeks to predict
-    'LSTM_UNITS': 128,     # Number of LSTM units (complexity)
-    'DROPOUT_RATE': 0.3,   # Regularization strength
-    'BATCH_SIZE': 16,      # Smaller batch size for better gradient estimates
-    'MAX_EPOCHS': 200,     # Allow more epochs with early stopping
-    'PATIENCE': 15,        # More patience for complex model
-    'MIN_DELTA': 0.0001,   # Minimum improvement threshold
+    'LSTM_UNITS': 64,      # Reduced for stability (was 128)
+    'DROPOUT_RATE': 0.2,   # Reduced dropout for better convergence
+    'BATCH_SIZE': 32,      # Increased batch size for stability
+    'MAX_EPOCHS': 100,     # Reduced for faster testing
+    'PATIENCE': 10,        # Reduced patience
+    'MIN_DELTA': 0.001,    # Slightly larger minimum improvement threshold
 }
 
 # Calculate periods in hours
@@ -396,14 +465,29 @@ X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
 
 print(f"Training data shape: {X_train.shape}")
 
-# 4. Build and train complex model
+# 4. Build and train complex model with error handling
 print(f"\n4. Building advanced LSTM model...")
-model = build_complex_lstm_model(
-    SEQUENCE_LENGTH, 
-    lstm_units=CONFIG['LSTM_UNITS'],
-    dropout_rate=CONFIG['DROPOUT_RATE']
-)
-print(model.summary())
+
+try:
+    model = build_complex_lstm_model(
+        SEQUENCE_LENGTH, 
+        lstm_units=CONFIG['LSTM_UNITS'],
+        dropout_rate=CONFIG['DROPOUT_RATE']
+    )
+    print("Model built successfully!")
+    print(model.summary())
+    
+except Exception as e:
+    print(f"Error during model creation: {e}")
+    print("Trying with CPU fallback...")
+    model = build_complex_lstm_model(
+        SEQUENCE_LENGTH, 
+        lstm_units=CONFIG['LSTM_UNITS'],
+        dropout_rate=CONFIG['DROPOUT_RATE'],
+        use_cpu_fallback=True
+    )
+    print("Fallback model built successfully!")
+    print(model.summary())
 
 # Enhanced callbacks
 early_stopping = EarlyStopping(
@@ -431,25 +515,54 @@ lr_scheduler = ReduceLROnPlateau(
     verbose=1
 )
 
-print(f"\nTraining complex model with advanced callbacks...")
+print(f"\nTraining model with robust error handling...")
 print(f"  Max epochs: {CONFIG['MAX_EPOCHS']}")
 print(f"  Early stopping patience: {CONFIG['PATIENCE']}")
 print(f"  Batch size: {CONFIG['BATCH_SIZE']}")
+print(f"  Device: {'GPU' if gpu_available else 'CPU'}")
 
-# Train the model
-history = model.fit(
-    X_train, y_train,
-    batch_size=CONFIG['BATCH_SIZE'],
-    epochs=CONFIG['MAX_EPOCHS'],
-    validation_data=(X_val, y_val),
-    callbacks=[early_stopping, model_checkpoint, lr_scheduler],
-    verbose=1,
-    shuffle=False
-)
-
-epochs_trained = len(history.history['loss'])
-print(f"\nTraining completed after {epochs_trained} epochs.")
-print("Best model saved as 'best_electricity_complex_lstm_model.h5'")
+# Train the model with error handling
+try:
+    history = model.fit(
+        X_train, y_train,
+        batch_size=CONFIG['BATCH_SIZE'],
+        epochs=CONFIG['MAX_EPOCHS'],
+        validation_data=(X_val, y_val),
+        callbacks=[early_stopping, model_checkpoint, lr_scheduler],
+        verbose=1,
+        shuffle=False
+    )
+    
+    epochs_trained = len(history.history['loss'])
+    print(f"\nTraining completed successfully after {epochs_trained} epochs.")
+    print("Best model saved as 'best_electricity_complex_lstm_model.h5'")
+    
+except Exception as e:
+    print(f"Training error: {e}")
+    print("Trying simplified training approach...")
+    
+    # Simplified training without some callbacks if there are issues
+    try:
+        history = model.fit(
+            X_train, y_train,
+            batch_size=CONFIG['BATCH_SIZE'],
+            epochs=min(CONFIG['MAX_EPOCHS'], 20),  # Reduced epochs for fallback
+            validation_data=(X_val, y_val),
+            callbacks=[early_stopping],  # Only essential callback
+            verbose=1,
+            shuffle=False
+        )
+        epochs_trained = len(history.history['loss'])
+        print(f"\nSimplified training completed after {epochs_trained} epochs.")
+        
+        # Manually save the model
+        model.save('electricity_complex_lstm_model_manual.h5')
+        print("Model saved manually as 'electricity_complex_lstm_model_manual.h5'")
+        
+    except Exception as e2:
+        print(f"Simplified training also failed: {e2}")
+        print("Please check your TensorFlow/CUDA installation.")
+        exit()
 
 # 5. Comprehensive evaluation
 print(f"\n5. Comprehensive model evaluation...")
