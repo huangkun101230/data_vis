@@ -101,7 +101,7 @@ def train_model(model, train_loader, val_loader, epochs, lr, device):
         else:
             early_stop +=1
             if early_stop == 10:
-                print(stop training)
+                print("stop training")
                 exit()
         
 
