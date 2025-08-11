@@ -11,8 +11,8 @@ from datetime import datetime
 SEQ_LENGTH = 24 * 30   # 1 month (hours)
 PRED_LENGTH = 24 * 7   # 1 week (hours)
 BATCH_SIZE = 32
-EPOCHS = 20
-LR = 1e-3
+EPOCHS = 2000
+LR = 1e-4
 HIDDEN_SIZE = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -69,7 +69,8 @@ class SimpleRNN(nn.Module):
 def train_model(model, train_loader, val_loader, epochs, lr, device):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
+    record = 999999999999
+    early_stop = 0
     for epoch in range(epochs):
         model.train()
         train_loss = 0
@@ -91,8 +92,18 @@ def train_model(model, train_loader, val_loader, epochs, lr, device):
                 xb, yb = xb.to(device), yb.to(device)
                 preds = model(xb)
                 val_loss += criterion(preds, yb).item()
-
         print(f"Epoch [{epoch+1}/{epochs}] Train Loss: {train_loss/len(train_loader):.4f}  Val Loss: {val_loss/len(val_loader):.4f}")
+        if val_loss<record:
+            record = val_loss
+            early_stop = 0
+            torch.save(model.state_dict(), "simple_rnn_consumption.pth")
+            print("Model saved as simple_rnn_consumption.pth")
+        else:
+            early_stop +=1
+            if early_stop == 10:
+                print(stop training)
+                exit()
+        
 
     return model
 
@@ -119,5 +130,5 @@ if __name__ == "__main__":
 
     model = train_model(model, train_loader, val_loader, EPOCHS, LR, DEVICE)
 
-    torch.save(model.state_dict(), "simple_rnn_consumption.pth")
-    print("Model saved as simple_rnn_consumption.pth")
+    # torch.save(model.state_dict(), "simple_rnn_consumption.pth")
+    # print("Model saved as simple_rnn_consumption.pth")
