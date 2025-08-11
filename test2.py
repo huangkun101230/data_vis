@@ -11,7 +11,7 @@ from datetime import datetime
 SEQ_LENGTH = 24 * 30   # 1 month (hours)
 PRED_LENGTH = 24 * 7   # 1 week (hours)
 BATCH_SIZE = 32
-EPOCHS = 2000
+EPOCHS = 20000000
 LR = 1e-4
 HIDDEN_SIZE = 64
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
