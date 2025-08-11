@@ -29,15 +29,12 @@ class ConsumptionDataset(Dataset):
         df["dayofweek"] = df["DateTime"].dt.dayofweek
         df["month"] = df["DateTime"].dt.month
 
-        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
         df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-        df["dow_sin"] = np.sin(2 * np.pi * df["dayofweek"] / 7)
         df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
-        df["month_sin"] = np.sin(2 * np.pi * df["month"] / 12)
         df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
         # Features: time encodings + consumption
-        features = ["hour_sin", "hour_cos", "dow_sin", "dow_cos", "month_sin", "month_cos", "Consumption"]
+        features = [""hour_cos", "dow_cos", "month_cos", "Consumption"]
         self.data = df[features].values.astype(np.float32)
 
     def __len__(self):
