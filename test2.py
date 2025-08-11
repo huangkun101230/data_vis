@@ -1,593 +1,349 @@
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout, BatchNormalization
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
-import warnings
+# electricity_lstm_pytorch.py
 import os
+import warnings
 warnings.filterwarnings('ignore')
 
-# GPU Configuration and Error Handling
-def configure_tensorflow():
-    """Configure TensorFlow for optimal performance and handle GPU issues"""
-    try:
-        # Check for GPU availability
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        if gpus:
-            print(f"Found {len(gpus)} GPU(s): {[gpu.name for gpu in gpus]}")
-            try:
-                # Try to configure GPU memory growth
-                for gpu in gpus:
-                    tf.config.experimental.set_memory_growth(gpu, True)
-                print("GPU memory growth configured successfully")
-                
-                # Set mixed precision for better performance
-                tf.keras.mixed_precision.set_global_policy('mixed_float16')
-                print("Mixed precision enabled for faster training")
-                return True
-                
-            except Exception as gpu_error:
-                print(f"GPU configuration failed: {gpu_error}")
-                print("Falling back to CPU execution...")
-                # Force CPU execution
-                tf.config.set_visible_devices([], 'GPU')
-                return False
-        else:
-            print("No GPU found, using CPU")
-            return False
-            
-    except Exception as e:
-        print(f"TensorFlow configuration error: {e}")
-        print("Using default CPU configuration")
-        # Force CPU execution as fallback
-        os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-        return False
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
-# Configure TensorFlow before setting seeds
-gpu_available = configure_tensorflow()
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import random
+import datetime
 
-# Set random seeds for reproducibility
-np.random.seed(42)
-tf.random.set_seed(42)
+# ---------------------------
+# Configuration & Seeding
+# ---------------------------
+CONFIG = {
+    'INPUT_WEEKS': 4,
+    'OUTPUT_WEEKS': 1,
+    'LSTM_UNITS': 64,
+    'DROPOUT_RATE': 0.2,
+    'BATCH_SIZE': 32,
+    'MAX_EPOCHS': 100,
+    'PATIENCE': 10,
+    'MIN_DELTA': 0.001,
+    'LEARNING_RATE': 1e-3,
+    'MODEL_DIR': './models'
+}
+os.makedirs(CONFIG['MODEL_DIR'], exist_ok=True)
 
+SEQUENCE_LENGTH = CONFIG['INPUT_WEEKS'] * 7 * 24
+FORECAST_HORIZON = CONFIG['OUTPUT_WEEKS'] * 7 * 24
+
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# ---------------------------
+# Device & Mixed Precision
+# ---------------------------
+def configure_torch():
+    use_gpu = torch.cuda.is_available()
+    device = torch.device('cuda' if use_gpu else 'cpu')
+    if use_gpu:
+        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("No GPU found, using CPU")
+    return device
+
+device = configure_torch()
+USE_AMP = torch.cuda.is_available()  # automatic mixed precision if GPU available
+
+# ---------------------------
+# Data Loading / Preprocessing
+# ---------------------------
 def load_electricity_data(file_path):
-    """Load and preprocess electricity consumption data from CSV"""
     print(f"Loading data from: {file_path}")
-    
     try:
-        # Load the CSV file
         df = pd.read_csv(file_path)
-        
-        # Display basic info about the dataset
         print(f"Dataset shape: {df.shape}")
-        print(f"Column names: {list(df.columns)}")
-        print(f"First few rows:")
-        print(df.head())
-        
-        # Try to identify DateTime and consumption columns
+        print("Columns:", list(df.columns))
+        # Try to infer datetime & consumption columns
+        datetime_candidates = ['datetime', 'date', 'time', 'timestamp', 'dt']
+        consumption_candidates = ['consumption', 'consume', 'demand', 'load', 'usage', 'kwh', 'mwh']
+
         datetime_col = None
         consumption_col = None
-        
-        # Look for datetime column (case-insensitive)
-        datetime_candidates = ['datetime', 'date', 'time', 'timestamp', 'dt']
+
         for col in df.columns:
-            if any(candidate in col.lower() for candidate in datetime_candidates):
+            if any(c in col.lower() for c in datetime_candidates):
                 datetime_col = col
                 break
-        
-        # Look for consumption column (case-insensitive)
-        consumption_candidates = ['consumption', 'consume', 'demand', 'load', 'usage', 'kwh', 'mwh']
         for col in df.columns:
-            if any(candidate in col.lower() for candidate in consumption_candidates):
+            if any(c in col.lower() for c in consumption_candidates):
                 consumption_col = col
                 break
-        
-        # If not found automatically, use user specification or first available numeric column
+
         if datetime_col is None:
-            datetime_col = df.columns[0]  # Assume first column is datetime
-            print(f"Warning: Using '{datetime_col}' as DateTime column (not auto-detected)")
-        
+            datetime_col = df.columns[0]
+            print(f"Warning: using '{datetime_col}' as datetime column (not auto-detected)")
         if consumption_col is None:
-            # Find first numeric column that's not the datetime column
-            numeric_cols = df.select_dtypes(include=[np.number]).columns
-            consumption_col = [col for col in numeric_cols if col != datetime_col][0]
-            print(f"Warning: Using '{consumption_col}' as consumption column (not auto-detected)")
-        
-        print(f"Using DateTime column: '{datetime_col}'")
-        print(f"Using consumption column: '{consumption_col}'")
-        
-        # Convert datetime column to datetime type
+            numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+            consumption_col = [c for c in numeric_cols if c != datetime_col][0]
+            print(f"Warning: using '{consumption_col}' as consumption column (not auto-detected)")
+
+        print(f"Using DateTime: {datetime_col}, consumption: {consumption_col}")
+
         df[datetime_col] = pd.to_datetime(df[datetime_col])
-        
-        # Rename columns to standard names for consistency
         df_processed = pd.DataFrame({
             'DateTime': df[datetime_col],
             'consumption': df[consumption_col]
-        })
-        
-        # Sort by datetime to ensure proper order
-        df_processed = df_processed.sort_values('DateTime').reset_index(drop=True)
-        
-        # Remove any missing values
+        }).sort_values('DateTime').reset_index(drop=True)
+
         initial_rows = len(df_processed)
         df_processed = df_processed.dropna()
         if len(df_processed) < initial_rows:
-            print(f"Warning: Removed {initial_rows - len(df_processed)} rows with missing values")
-        
-        # Basic data validation
+            print(f"Removed {initial_rows - len(df_processed)} rows with missing values")
+
         if df_processed['consumption'].min() < 0:
-            print("Warning: Negative consumption values found. Consider data cleaning.")
-        
-        # Check for time gaps
-        df_processed['time_diff'] = df_processed['DateTime'].diff()
-        most_common_freq = df_processed['time_diff'].mode()[0] if len(df_processed) > 1 else pd.Timedelta(hours=1)
-        print(f"Most common time frequency: {most_common_freq}")
-        
-        # Display final dataset info
-        print(f"\nProcessed dataset info:")
+            print("Warning: negative consumption values found")
+
+        # compute most common freq
+        if len(df_processed) > 1:
+            df_processed['time_diff'] = df_processed['DateTime'].diff()
+            most_common_freq = df_processed['time_diff'].mode()[0]
+            print("Most common time frequency:", most_common_freq)
+            df_processed = df_processed.drop(columns=['time_diff'])
+        else:
+            print("Not enough rows to infer frequency")
+
+        print("Processed dataset info:")
         print(f"  Shape: {df_processed.shape}")
         print(f"  Date range: {df_processed['DateTime'].min()} to {df_processed['DateTime'].max()}")
         print(f"  Consumption range: {df_processed['consumption'].min():.2f} to {df_processed['consumption'].max():.2f}")
         print(f"  Average consumption: {df_processed['consumption'].mean():.2f}")
-        print(f"  Consumption std: {df_processed['consumption'].std():.2f}")
-        
-        # Remove the temporary time_diff column
-        df_processed = df_processed.drop('time_diff', axis=1)
-        
+
         return df_processed
-        
+
     except FileNotFoundError:
-        print(f"Error: File '{file_path}' not found.")
-        print("Please make sure the file exists in the current directory.")
+        print(f"Error: '{file_path}' not found.")
         return None
     except Exception as e:
-        print(f"Error loading data: {str(e)}")
-        print("Please check the file format and column names.")
+        print("Error loading data:", e)
         return None
 
-def prepare_sequences(data, sequence_length):
-    """Prepare sequences for LSTM training"""
+def prepare_sequences(data_array, seq_len):
     sequences = []
     targets = []
-    
-    for i in range(len(data) - sequence_length):
-        seq = data[i:i + sequence_length]
-        target = data[i + sequence_length]
-        sequences.append(seq)
-        targets.append(target)
-    
+    for i in range(len(data_array) - seq_len):
+        sequences.append(data_array[i:i+seq_len])
+        targets.append(data_array[i+seq_len])
     return np.array(sequences), np.array(targets)
 
-def build_complex_lstm_model(sequence_length, lstm_units=128, dropout_rate=0.3, use_cpu_fallback=False):
-    """Build a more complex LSTM model with regularization and error handling"""
-    
-    # If GPU failed, use smaller model for CPU training
-    if use_cpu_fallback or not gpu_available:
-        print("Using CPU-optimized model configuration...")
-        lstm_units = min(lstm_units, 64)  # Reduce complexity for CPU
-        dropout_rate = min(dropout_rate, 0.2)  # Reduce dropout
-    
-    try:
-        with tf.device('/CPU:0' if use_cpu_fallback else '/GPU:0' if gpu_available else '/CPU:0'):
-            model = Sequential([
-                # First LSTM layer with more units
-                LSTM(lstm_units, 
-                     return_sequences=True, 
-                     input_shape=(sequence_length, 1),
-                     activation='tanh',
-                     recurrent_activation='sigmoid',
-                     dropout=dropout_rate,
-                     recurrent_dropout=dropout_rate),
-                BatchNormalization(),
-                
-                # Second LSTM layer
-                LSTM(lstm_units // 2, 
-                     return_sequences=True,
-                     activation='tanh',
-                     recurrent_activation='sigmoid',
-                     dropout=dropout_rate,
-                     recurrent_dropout=dropout_rate),
-                BatchNormalization(),
-                
-                # Third LSTM layer
-                LSTM(lstm_units // 4, 
-                     return_sequences=False,
-                     activation='tanh',
-                     recurrent_activation='sigmoid',
-                     dropout=dropout_rate),
-                BatchNormalization(),
-                
-                # Dense layers with regularization
-                Dense(64, activation='relu'),
-                Dropout(dropout_rate),
-                
-                Dense(32, activation='relu'),
-                Dropout(dropout_rate / 2),
-                
-                Dense(16, activation='relu'),
-                Dense(1, dtype='float32')  # Ensure float32 output
-            ])
-            
-            # Use a more sophisticated optimizer with learning rate scheduling
-            optimizer = Adam(
-                learning_rate=0.001,
-                beta_1=0.9,
-                beta_2=0.999,
-                epsilon=1e-07
-            )
-            
-            model.compile(
-                optimizer=optimizer,
-                loss='huber',  # More robust to outliers than MSE
-                metrics=['mae', 'mse']
-            )
-            
-            return model
-            
-    except Exception as e:
-        print(f"Error building model: {e}")
-        print("Trying fallback model configuration...")
-        
-        # Simple fallback model
-        model = Sequential([
-            LSTM(32, input_shape=(sequence_length, 1)),
-            Dense(16, activation='relu'),
-            Dense(1)
-        ])
-        
-        model.compile(
-            optimizer='adam',
-            loss='mse',
-            metrics=['mae']
-        )
-        
-        return model
+# ---------------------------
+# PyTorch Dataset
+# ---------------------------
+class SequenceDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32).unsqueeze(-1)
 
-def plot_results(actual, predicted, title="Electricity Consumption Forecast"):
-    """Plot actual vs predicted values"""
-    plt.figure(figsize=(15, 8))
-    plt.plot(actual, label='Actual', alpha=0.8, linewidth=1.2)
-    plt.plot(predicted, label='Predicted', alpha=0.9, linewidth=1.2)
-    plt.title(title, fontsize=16)
-    plt.xlabel('Time Steps', fontsize=12)
-    plt.ylabel('Consumption (kWh)', fontsize=12)
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.tight_layout()
-    plt.show()
+    def __len__(self):
+        return len(self.X)
 
-def forecast_future(model, last_sequence, steps, scaler):
-    """Generate future predictions with confidence intervals"""
-    predictions = []
-    current_sequence = last_sequence.copy()
-    
-    for _ in range(steps):
-        # Predict next value
-        next_pred = model.predict(current_sequence.reshape(1, -1, 1), verbose=0)
-        predictions.append(next_pred[0, 0])
-        
-        # Update sequence (remove first, add prediction)
-        current_sequence = np.append(current_sequence[1:], next_pred[0, 0])
-    
-    return np.array(predictions)
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
 
-def analyze_input_output_recommendations():
-    """Provide recommendations for input/output periods"""
-    recommendations = {
-        'input_periods': {
-            '1_week': {'hours': 168, 'description': 'Good for capturing weekly patterns'},
-            '2_weeks': {'hours': 336, 'description': 'Better for complex weekly patterns'},
-            '1_month': {'hours': 720, 'description': 'Captures monthly billing cycles'},
-            '2_months': {'hours': 1440, 'description': 'Comprehensive pattern capture'},
-        },
-        'output_periods': {
-            '1_day': {'hours': 24, 'description': 'Short-term operational planning'},
-            '3_days': {'hours': 72, 'description': 'Weekend planning'},
-            '1_week': {'hours': 168, 'description': 'Weekly scheduling and maintenance'},
-            '1_month': {'hours': 720, 'description': 'Long-term capacity planning'},
-        }
-    }
-    
-    print("=== INPUT/OUTPUT PERIOD RECOMMENDATIONS ===\n")
-    
-    print("INPUT PERIOD OPTIONS (Historical data to use):")
-    for period, info in recommendations['input_periods'].items():
-        print(f"  {period.replace('_', ' ').title()}: {info['hours']} hours - {info['description']}")
-    
-    print(f"\nOUTPUT PERIOD OPTIONS (Forecast horizon):")
-    for period, info in recommendations['output_periods'].items():
-        print(f"  {period.replace('_', ' ').title()}: {info['hours']} hours - {info['description']}")
-    
-    print(f"\nRECOMMENDED COMBINATIONS:")
-    print(f"  • Conservative: 1 month input → 1 week output (720 → 168)")
-    print(f"  • Balanced: 2 weeks input → 3 days output (336 → 72)")
-    print(f"  • Aggressive: 2 months input → 1 month output (1440 → 720)")
-    print(f"  • Operational: 1 week input → 1 day output (168 → 24)")
-    
-    return recommendations
+# ---------------------------
+# Model Definition
+# ---------------------------
+class ComplexLSTM(nn.Module):
+    def __init__(self, seq_len, lstm_units=64, dropout_rate=0.2, cpu_fallback=False):
+        super().__init__()
+        # reduce size for CPU fallback
+        if cpu_fallback and not torch.cuda.is_available():
+            lstm_units = min(lstm_units, 64)
+            dropout_rate = min(dropout_rate, 0.2)
 
-# Configuration options - adjusted for stability
-CONFIG = {
-    'INPUT_WEEKS': 4,      # How many weeks of historical data to use
-    'OUTPUT_WEEKS': 1,     # How many weeks to predict
-    'LSTM_UNITS': 64,      # Reduced for stability (was 128)
-    'DROPOUT_RATE': 0.2,   # Reduced dropout for better convergence
-    'BATCH_SIZE': 32,      # Increased batch size for stability
-    'MAX_EPOCHS': 100,     # Reduced for faster testing
-    'PATIENCE': 10,        # Reduced patience
-    'MIN_DELTA': 0.001,    # Slightly larger minimum improvement threshold
-}
+        # We'll create stacked LSTMs with batch norm in between.
+        self.lstm1 = nn.LSTM(input_size=1, hidden_size=lstm_units, batch_first=True)
+        self.bn1 = nn.BatchNorm1d(seq_len)  # batchnorm over sequence dim: we will transpose appropriately
+        self.dropout1 = nn.Dropout(dropout_rate)
 
-# Calculate periods in hours
-SEQUENCE_LENGTH = CONFIG['INPUT_WEEKS'] * 7 * 24  # Input period
-FORECAST_HORIZON = CONFIG['OUTPUT_WEEKS'] * 7 * 24  # Output period
+        self.lstm2 = nn.LSTM(input_size=lstm_units, hidden_size=lstm_units // 2, batch_first=True)
+        self.bn2 = nn.BatchNorm1d(seq_len)
+        self.dropout2 = nn.Dropout(dropout_rate)
 
-# Main execution
-print("=== Advanced Electricity Consumption Forecasting with Complex LSTM ===\n")
+        self.lstm3 = nn.LSTM(input_size=lstm_units // 2, hidden_size=lstm_units // 4, batch_first=True)
+        # final BN not over sequence (we'll BN the last timestep features)
+        self.bn3 = nn.BatchNorm1d(lstm_units // 4)
+        self.dropout3 = nn.Dropout(dropout_rate)
 
-# Show recommendations first
-recommendations = analyze_input_output_recommendations()
+        self.fc1 = nn.Linear(lstm_units // 4, 64)
+        self.drop_fc1 = nn.Dropout(dropout_rate)
+        self.fc2 = nn.Linear(64, 32)
+        self.drop_fc2 = nn.Dropout(dropout_rate / 2)
+        self.fc3 = nn.Linear(32, 16)
+        self.out = nn.Linear(16, 1)
 
-print(f"\nCURRENT CONFIGURATION:")
-print(f"  Input Period: {CONFIG['INPUT_WEEKS']} weeks ({SEQUENCE_LENGTH} hours)")
-print(f"  Output Period: {CONFIG['OUTPUT_WEEKS']} weeks ({FORECAST_HORIZON} hours)")
-print(f"  Model Complexity: {CONFIG['LSTM_UNITS']} LSTM units with {CONFIG['DROPOUT_RATE']} dropout")
+        self.relu = nn.ReLU()
 
-# 1. Load real electricity data
-print(f"\n1. Loading electricity consumption data from CSV...")
-df = load_electricity_data('./electricityConsumptionAndProductioction.csv')
+    def forward(self, x):
+        # x shape: (batch, seq_len, 1)
+        b, seq_len, _ = x.shape
 
-# Check if data loading was successful
-if df is None:
-    print("Failed to load data. Please check the file path and format.")
-    exit()
+        # LSTM1
+        out, _ = self.lstm1(x)  # (b, seq_len, hidden)
+        # BatchNorm1d expects (b, features, seq_len) or (b, seq_len, features) depending usage.
+        # We'll transpose to (b, seq_len, features) -> BN over features for each timestep by using BN1d on last dim requires permute.
+        # Simpler: apply BN over features by reshaping to (b*seq_len, features), then back.
+        out_reshaped = out.contiguous().view(-1, out.size(2))
+        out_bn = nn.functional.batch_norm(out_reshaped, running_mean=None, running_var=None, training=self.training)
+        out = out_bn.view(b, seq_len, -1)
+        out = self.dropout1(out)
 
-print(f"Successfully loaded dataset!")
-print(f"Dataset shape: {df.shape}")
-print(f"Date range: {df['DateTime'].min()} to {df['DateTime'].max()}")
-print(f"Consumption range: {df['consumption'].min():.2f} to {df['consumption'].max():.2f} kWh")
+        # LSTM2
+        out, _ = self.lstm2(out)
+        out_reshaped = out.contiguous().view(-1, out.size(2))
+        out_bn = nn.functional.batch_norm(out_reshaped, running_mean=None, running_var=None, training=self.training)
+        out = out_bn.view(b, seq_len, -1)
+        out = self.dropout2(out)
 
-# Add data exploration for real dataset
-print(f"\n1.5. Exploring your dataset...")
+        # LSTM3 -> keep only last timestep
+        out, _ = self.lstm3(out)  # (b, seq_len, hidden3)
+        last = out[:, -1, :]  # (b, hidden3)
+        last_bn = self.bn3(last)
+        last = self.dropout3(last_bn)
 
-# Plot basic statistics and patterns
-fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+        # Dense stack
+        x = self.relu(self.fc1(last))
+        x = self.drop_fc1(x)
+        x = self.relu(self.fc2(x))
+        x = self.drop_fc2(x)
+        x = self.relu(self.fc3(x))
+        out = self.out(x).float()  # ensure float32
+        return out
 
-# Time series plot (sample if too large)
-sample_size = min(1000, len(df))
-sample_idx = np.linspace(0, len(df)-1, sample_size, dtype=int)
-axes[0,0].plot(df.iloc[sample_idx]['DateTime'], df.iloc[sample_idx]['consumption'], alpha=0.7)
-axes[0,0].set_title('Time Series Overview (Sample)')
-axes[0,0].set_xlabel('Date')
-axes[0,0].set_ylabel('Consumption')
-axes[0,0].tick_params(axis='x', rotation=45)
-axes[0,0].grid(True, alpha=0.3)
+# ---------------------------
+# Training Utilities
+# ---------------------------
+def train_model(model, train_loader, val_loader, config, device):
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=config['LEARNING_RATE'])
+    criterion = nn.SmoothL1Loss()  # Huber-like
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=max(1, config['PATIENCE']//2), verbose=True, min_lr=1e-6)
 
-# Consumption distribution
-axes[0,1].hist(df['consumption'], bins=50, alpha=0.7, edgecolor='black')
-axes[0,1].set_title('Consumption Distribution')
-axes[0,1].set_xlabel('Consumption (kWh)')
-axes[0,1].set_ylabel('Frequency')
-axes[0,1].grid(True, alpha=0.3)
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_path = os.path.join(config['MODEL_DIR'], 'best_electricity_complex_lstm_model.pt')
 
-# Daily pattern (if enough data)
-if len(df) >= 24:
-    df['hour'] = df['DateTime'].dt.hour
-    hourly_avg = df.groupby('hour')['consumption'].mean()
-    axes[1,0].plot(hourly_avg.index, hourly_avg.values, marker='o')
-    axes[1,0].set_title('Average Hourly Consumption Pattern')
-    axes[1,0].set_xlabel('Hour of Day')
-    axes[1,0].set_ylabel('Average Consumption')
-    axes[1,0].grid(True, alpha=0.3)
-    axes[1,0].set_xticks(range(0, 24, 4))
-else:
-    axes[1,0].text(0.5, 0.5, 'Not enough data\nfor hourly pattern', 
-                   ha='center', va='center', transform=axes[1,0].transAxes)
+    scaler = torch.cuda.amp.GradScaler() if USE_AMP else None
+    history = {'train_loss': [], 'val_loss': [], 'mae': [], 'val_mae': []}
 
-# Weekly pattern (if enough data)
-if len(df) >= 7*24:
-    df['dayofweek'] = df['DateTime'].dt.dayofweek
-    daily_avg = df.groupby('dayofweek')['consumption'].mean()
-    day_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
-    axes[1,1].bar(range(7), daily_avg.values, alpha=0.7)
-    axes[1,1].set_title('Average Daily Consumption Pattern')
-    axes[1,1].set_xlabel('Day of Week')
-    axes[1,1].set_ylabel('Average Consumption')
-    axes[1,1].set_xticks(range(7))
-    axes[1,1].set_xticklabels(day_names)
-    axes[1,1].grid(True, alpha=0.3)
-else:
-    axes[1,1].text(0.5, 0.5, 'Not enough data\nfor weekly pattern', 
-                   ha='center', va='center', transform=axes[1,1].transAxes)
+    for epoch in range(1, config['MAX_EPOCHS'] + 1):
+        model.train()
+        train_losses = []
+        train_maes = []
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad()
+            if USE_AMP:
+                with torch.cuda.amp.autocast():
+                    preds = model(xb)
+                    loss = criterion(preds, yb)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                preds = model(xb)
+                loss = criterion(preds, yb)
+                loss.backward()
+                optimizer.step()
 
-plt.tight_layout()
-plt.show()
+            train_losses.append(loss.item())
+            train_maes.append(mean_absolute_error(yb.detach().cpu().numpy(), preds.detach().cpu().numpy()))
 
-# Data quality assessment
-print(f"\nData Quality Assessment:")
-print(f"  Total records: {len(df):,}")
-print(f"  Missing values: {df.isnull().sum().sum()}")
-print(f"  Zero/negative consumption: {(df['consumption'] <= 0).sum()}")
-print(f"  Duplicate timestamps: {df['DateTime'].duplicated().sum()}")
+        # validation
+        model.eval()
+        val_losses = []
+        val_maes = []
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb = xb.to(device)
+                yb = yb.to(device)
+                if USE_AMP:
+                    with torch.cuda.amp.autocast():
+                        preds = model(xb)
+                        loss = criterion(preds, yb)
+                else:
+                    preds = model(xb)
+                    loss = criterion(preds, yb)
+                val_losses.append(loss.item())
+                val_maes.append(mean_absolute_error(yb.cpu().numpy(), preds.cpu().numpy()))
 
-# Time frequency analysis
-time_diffs = df['DateTime'].diff().dropna()
-most_common_diff = time_diffs.mode()[0] if len(time_diffs) > 0 else None
-print(f"  Most common time interval: {most_common_diff}")
-print(f"  Time gaps > 2x common interval: {(time_diffs > 2 * most_common_diff).sum() if most_common_diff else 'N/A'}")
+        train_loss = np.mean(train_losses)
+        val_loss = np.mean(val_losses)
+        train_mae = np.mean(train_maes)
+        val_mae = np.mean(val_maes)
 
-# Remove temporary columns if created
-df = df.drop(columns=['hour', 'dayofweek'], errors='ignore')
-# 2. Enhanced data preprocessing
-print(f"\n2. Preprocessing real electricity data with advanced normalization...")
-# Use RobustScaler-like approach to handle outliers better
-q25, q75 = np.percentile(df['consumption'].values, [25, 75])
-iqr = q75 - q25
-median = np.median(df['consumption'].values)
+        history['train_loss'].append(train_loss)
+        history['val_loss'].append(val_loss)
+        history['mae'].append(train_mae)
+        history['val_mae'].append(val_mae)
 
-# Modified normalization that's more robust to outliers
-scaler = MinMaxScaler(feature_range=(-1, 1))  # Different range for better gradient flow
-scaled_consumption = scaler.fit_transform(df['consumption'].values.reshape(-1, 1)).flatten()
+        print(f"Epoch {epoch}/{config['MAX_EPOCHS']} - train_loss: {train_loss:.6f} val_loss: {val_loss:.6f} train_mae: {train_mae:.4f} val_mae: {val_mae:.4f}")
 
-# Split data with more sophisticated approach
-total_samples = len(scaled_consumption) - SEQUENCE_LENGTH
-train_size = int(0.7 * total_samples)  # More data for training
-val_size = int(0.15 * total_samples)
-test_size = total_samples - train_size - val_size
+        scheduler.step(val_loss)
 
-print(f"Input sequence length: {SEQUENCE_LENGTH} hours ({SEQUENCE_LENGTH/24:.1f} days)")
-print(f"Forecast horizon: {FORECAST_HORIZON} hours ({FORECAST_HORIZON/24:.1f} days)")
-print(f"Training samples: {train_size}")
-print(f"Validation samples: {val_size}")
-print(f"Test samples: {test_size}")
+        # early stopping logic
+        if val_loss + config['MIN_DELTA'] < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            torch.save({'model_state': model.state_dict(), 'optimizer_state': optimizer.state_dict(), 'epoch': epoch}, best_path)
+            print(f"  Saved best model to {best_path}")
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= config['PATIENCE']:
+                print(f"Early stopping at epoch {epoch}. No improvement in val_loss for {epochs_no_improve} epochs.")
+                break
 
-# 3. Prepare sequences
-print(f"\n3. Preparing sequences for advanced LSTM...")
-X, y = prepare_sequences(scaled_consumption, SEQUENCE_LENGTH)
+    # load best model
+    if os.path.exists(best_path):
+        ckpt = torch.load(best_path, map_location=device)
+        model.load_state_dict(ckpt['model_state'])
+    return model, history
 
-# Split datasets
-X_train = X[:train_size]
-y_train = y[:train_size]
-X_val = X[train_size:train_size + val_size]
-y_val = y[train_size:train_size + val_size]
-X_test = X[train_size + val_size:]
-y_test = y[train_size + val_size:]
+# ---------------------------
+# Forecast helper (autoregressive)
+# ---------------------------
+def forecast_future(model, last_sequence, steps, scaler, device):
+    model.eval()
+    preds = []
+    seq = last_sequence.copy()
+    with torch.no_grad():
+        for _ in range(steps):
+            x = torch.tensor(seq.reshape(1, -1, 1), dtype=torch.float32).to(device)
+            if USE_AMP:
+                with torch.cuda.amp.autocast():
+                    p = model(x).cpu().numpy().ravel()[0]
+            else:
+                p = model(x).cpu().numpy().ravel()[0]
+            preds.append(p)
+            seq = np.append(seq[1:], p)
+    # inverse transform
+    preds_inv = scaler.inverse_transform(np.array(preds).reshape(-1, 1)).flatten()
+    return preds_inv
 
-# Reshape for LSTM
-X_train = X_train.reshape(X_train.shape[0], X_train.shape[1], 1)
-X_val = X_val.reshape(X_val.shape[0], X_val.shape[1], 1)
-X_test = X_test.reshape(X_test.shape[0], X_test.shape[1], 1)
-
-print(f"Training data shape: {X_train.shape}")
-
-# 4. Build and train complex model with error handling
-print(f"\n4. Building advanced LSTM model...")
-
-try:
-    model = build_complex_lstm_model(
-        SEQUENCE_LENGTH, 
-        lstm_units=CONFIG['LSTM_UNITS'],
-        dropout_rate=CONFIG['DROPOUT_RATE']
-    )
-    print("Model built successfully!")
-    print(model.summary())
-    
-except Exception as e:
-    print(f"Error during model creation: {e}")
-    print("Trying with CPU fallback...")
-    model = build_complex_lstm_model(
-        SEQUENCE_LENGTH, 
-        lstm_units=CONFIG['LSTM_UNITS'],
-        dropout_rate=CONFIG['DROPOUT_RATE'],
-        use_cpu_fallback=True
-    )
-    print("Fallback model built successfully!")
-    print(model.summary())
-
-# Enhanced callbacks
-early_stopping = EarlyStopping(
-    monitor='val_loss',
-    patience=CONFIG['PATIENCE'],
-    restore_best_weights=True,
-    verbose=1,
-    min_delta=CONFIG['MIN_DELTA']
-)
-
-model_checkpoint = ModelCheckpoint(
-    'best_electricity_complex_lstm_model.h5',
-    monitor='val_loss',
-    save_best_only=True,
-    save_weights_only=False,
-    verbose=1
-)
-
-# Learning rate reduction on plateau
-lr_scheduler = ReduceLROnPlateau(
-    monitor='val_loss',
-    factor=0.5,
-    patience=CONFIG['PATIENCE']//2,
-    min_lr=1e-6,
-    verbose=1
-)
-
-print(f"\nTraining model with robust error handling...")
-print(f"  Max epochs: {CONFIG['MAX_EPOCHS']}")
-print(f"  Early stopping patience: {CONFIG['PATIENCE']}")
-print(f"  Batch size: {CONFIG['BATCH_SIZE']}")
-print(f"  Device: {'GPU' if gpu_available else 'CPU'}")
-
-# Train the model with error handling
-try:
-    history = model.fit(
-        X_train, y_train,
-        batch_size=CONFIG['BATCH_SIZE'],
-        epochs=CONFIG['MAX_EPOCHS'],
-        validation_data=(X_val, y_val),
-        callbacks=[early_stopping, model_checkpoint, lr_scheduler],
-        verbose=1,
-        shuffle=False
-    )
-    
-    epochs_trained = len(history.history['loss'])
-    print(f"\nTraining completed successfully after {epochs_trained} epochs.")
-    print("Best model saved as 'best_electricity_complex_lstm_model.h5'")
-    
-except Exception as e:
-    print(f"Training error: {e}")
-    print("Trying simplified training approach...")
-    
-    # Simplified training without some callbacks if there are issues
-    try:
-        history = model.fit(
-            X_train, y_train,
-            batch_size=CONFIG['BATCH_SIZE'],
-            epochs=min(CONFIG['MAX_EPOCHS'], 20),  # Reduced epochs for fallback
-            validation_data=(X_val, y_val),
-            callbacks=[early_stopping],  # Only essential callback
-            verbose=1,
-            shuffle=False
-        )
-        epochs_trained = len(history.history['loss'])
-        print(f"\nSimplified training completed after {epochs_trained} epochs.")
-        
-        # Manually save the model
-        model.save('electricity_complex_lstm_model_manual.h5')
-        print("Model saved manually as 'electricity_complex_lstm_model_manual.h5'")
-        
-    except Exception as e2:
-        print(f"Simplified training also failed: {e2}")
-        print("Please check your TensorFlow/CUDA installation.")
-        exit()
-
-# 5. Comprehensive evaluation
-print(f"\n5. Comprehensive model evaluation...")
-
-# Predictions on all datasets
-train_pred = model.predict(X_train, verbose=0)
-val_pred = model.predict(X_val, verbose=0)
-test_pred = model.predict(X_test, verbose=0)
-
-# Convert back to original scale
-train_pred_original = scaler.inverse_transform(train_pred.reshape(-1, 1)).flatten()
-val_pred_original = scaler.inverse_transform(val_pred.reshape(-1, 1)).flatten()
-test_pred_original = scaler.inverse_transform(test_pred.reshape(-1, 1)).flatten()
-
-train_actual_original = scaler.inverse_transform(y_train.reshape(-1, 1)).flatten()
-val_actual_original = scaler.inverse_transform(y_val.reshape(-1, 1)).flatten()
-test_actual_original = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-
-# Calculate comprehensive metrics
+# ---------------------------
+# Metrics
+# ---------------------------
 def calculate_metrics(actual, predicted, dataset_name):
     mae = mean_absolute_error(actual, predicted)
     rmse = np.sqrt(mean_squared_error(actual, predicted))
-    mape = np.mean(np.abs((actual - predicted) / actual)) * 100
-    r2 = 1 - (np.sum((actual - predicted) ** 2) / np.sum((actual - np.mean(actual)) ** 2))
-    
+    # mape safe: avoid division by zero
+    actual_safe = np.where(actual == 0, 1e-6, actual)
+    mape = np.mean(np.abs((actual - predicted) / actual_safe)) * 100
+    r2 = 1 - (np.sum((actual - predicted) ** 2) / np.sum((actual - np.mean(actual)) ** 2 + 1e-9))
     print(f"\n{dataset_name} Metrics:")
     print(f"  MAE: {mae:.2f} kWh")
     print(f"  RMSE: {rmse:.2f} kWh")
@@ -595,156 +351,180 @@ def calculate_metrics(actual, predicted, dataset_name):
     print(f"  R²: {r2:.4f}")
     return {'MAE': mae, 'RMSE': rmse, 'MAPE': mape, 'R2': r2}
 
-train_metrics = calculate_metrics(train_actual_original, train_pred_original, "Training")
-val_metrics = calculate_metrics(val_actual_original, val_pred_original, "Validation")
-test_metrics = calculate_metrics(test_actual_original, test_pred_original, "Test")
+# ---------------------------
+# Main Execution
+# ---------------------------
+if __name__ == '__main__':
+    print("=== Advanced Electricity Consumption Forecasting (PyTorch) ===")
+    recommendations = {
+        'input_periods': {'1_week':168, '2_weeks':336, '1_month':720, '2_months':1440},
+        'output_periods': {'1_day':24, '3_days':72, '1_week':168, '1_month':720}
+    }
+    print("Recommendations sample:", recommendations)
 
-# 6. Generate future forecasts
-print(f"\n6. Generating {FORECAST_HORIZON//24:.0f}-day forecast ({FORECAST_HORIZON} hours)...")
+    # Load CSV (change path as needed)
+    csv_path = './electricityConsumptionAndProductioction.csv'
+    df = load_electricity_data(csv_path)
+    if df is None:
+        print("Failed to load data. Exiting.")
+        exit()
 
-# Use the last sequence from the dataset
-last_sequence = scaled_consumption[-SEQUENCE_LENGTH:]
-future_predictions_scaled = forecast_future(model, last_sequence, FORECAST_HORIZON, scaler)
-future_predictions = scaler.inverse_transform(future_predictions_scaled.reshape(-1, 1)).flatten()
+    # Quick exploration (sampling)
+    sample_size = min(1000, len(df))
+    sample_idx = np.linspace(0, len(df)-1, sample_size, dtype=int)
+    plt.figure(figsize=(12,4))
+    plt.plot(df.iloc[sample_idx]['DateTime'], df.iloc[sample_idx]['consumption'], alpha=0.7)
+    plt.title("Time Series Sample")
+    plt.xlabel("Date")
+    plt.ylabel("Consumption")
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
 
-# Create future dates
-last_date = df['DateTime'].iloc[-1]
-future_dates = pd.date_range(start=last_date + pd.Timedelta(hours=1), 
-                           periods=FORECAST_HORIZON, 
-                           freq='H')
+    # Robust-ish scaling
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    scaled_consumption = scaler.fit_transform(df['consumption'].values.reshape(-1, 1)).flatten()
 
-# Create forecast DataFrame
-forecast_df = pd.DataFrame({
-    'DateTime': future_dates,
-    'predicted_consumption': future_predictions
-})
+    total_samples = len(scaled_consumption) - SEQUENCE_LENGTH
+    if total_samples <= 0:
+        raise ValueError("Not enough data for the chosen SEQUENCE_LENGTH")
 
-print(f"Forecast period: {future_dates[0]} to {future_dates[-1]}")
-print(f"Predicted consumption range: {future_predictions.min():.2f} to {future_predictions.max():.2f} kWh")
+    train_size = int(0.7 * total_samples)
+    val_size = int(0.15 * total_samples)
+    test_size = total_samples - train_size - val_size
+    print(f"Samples -> train: {train_size}, val: {val_size}, test: {test_size}")
 
-# 7. Advanced visualizations
-print(f"\n7. Creating comprehensive visualizations...")
+    # Prepare sequences
+    X, y = prepare_sequences(scaled_consumption, SEQUENCE_LENGTH)
+    X_train = X[:train_size]; y_train = y[:train_size]
+    X_val = X[train_size:train_size+val_size]; y_val = y[train_size:train_size+val_size]
+    X_test = X[train_size+val_size:]; y_test = y[train_size+val_size:]
 
-# Training history with multiple metrics
-fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    # Reshape (already (N, seq_len))
+    # Build datasets/dataloaders
+    train_ds = SequenceDataset(X_train.reshape(-1, SEQUENCE_LENGTH, 1), y_train)
+    val_ds = SequenceDataset(X_val.reshape(-1, SEQUENCE_LENGTH, 1), y_val)
+    test_ds = SequenceDataset(X_test.reshape(-1, SEQUENCE_LENGTH, 1), y_test)
 
-# Loss
-axes[0,0].plot(history.history['loss'], label='Training Loss', alpha=0.8)
-axes[0,0].plot(history.history['val_loss'], label='Validation Loss', alpha=0.8)
-axes[0,0].set_title('Model Loss (Huber)')
-axes[0,0].set_xlabel('Epoch')
-axes[0,0].set_ylabel('Loss')
-axes[0,0].legend()
-axes[0,0].grid(True, alpha=0.3)
+    train_loader = DataLoader(train_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=CONFIG['BATCH_SIZE'], shuffle=False)
 
-# MAE
-axes[0,1].plot(history.history['mae'], label='Training MAE', alpha=0.8)
-axes[0,1].plot(history.history['val_mae'], label='Validation MAE', alpha=0.8)
-axes[0,1].set_title('Mean Absolute Error')
-axes[0,1].set_xlabel('Epoch')
-axes[0,1].set_ylabel('MAE')
-axes[0,1].legend()
-axes[0,1].grid(True, alpha=0.3)
+    print("Building model...")
+    model = ComplexLSTM(SEQUENCE_LENGTH, lstm_units=CONFIG['LSTM_UNITS'], dropout_rate=CONFIG['DROPOUT_RATE'])
+    print(model)
 
-# Learning rate (if available)
-if 'lr' in history.history:
-    axes[1,0].plot(history.history['lr'], alpha=0.8, color='orange')
-    axes[1,0].set_title('Learning Rate Schedule')
-    axes[1,0].set_xlabel('Epoch')
-    axes[1,0].set_ylabel('Learning Rate')
-    axes[1,0].set_yscale('log')
-    axes[1,0].grid(True, alpha=0.3)
-else:
-    axes[1,0].text(0.5, 0.5, 'Learning Rate\nNot Tracked', ha='center', va='center', transform=axes[1,0].transAxes)
-    axes[1,0].set_title('Learning Rate Schedule')
+    try:
+        model, history = train_model(model, train_loader, val_loader, CONFIG, device)
+    except Exception as e:
+        print("Training error:", e)
+        print("Attempting CPU fallback model with smaller size...")
+        model = ComplexLSTM(SEQUENCE_LENGTH, lstm_units=min(CONFIG['LSTM_UNITS'], 64), dropout_rate=min(CONFIG['DROPOUT_RATE'], 0.2))
+        model, history = train_model(model, train_loader, val_loader, CONFIG, device)
 
-# Model complexity visualization
-complexity_data = [train_metrics['MAE'], val_metrics['MAE'], test_metrics['MAE']]
-axes[1,1].bar(['Train', 'Validation', 'Test'], complexity_data, alpha=0.7)
-axes[1,1].set_title('MAE Across Datasets')
-axes[1,1].set_ylabel('MAE (kWh)')
-axes[1,1].grid(True, alpha=0.3)
+    # Save final model
+    final_model_path = os.path.join(CONFIG['MODEL_DIR'], 'electricity_complex_lstm_model_final.pt')
+    torch.save({'model_state': model.state_dict(), 'scaler': scaler}, final_model_path)
+    print("Final model saved to", final_model_path)
 
-plt.tight_layout()
-plt.show()
+    # Evaluate on train/val/test
+    def predict_dataset(model, loader, device):
+        model.eval()
+        preds = []
+        trues = []
+        with torch.no_grad():
+            for xb, yb in loader:
+                xb = xb.to(device)
+                if USE_AMP:
+                    with torch.cuda.amp.autocast():
+                        p = model(xb).cpu().numpy().ravel()
+                else:
+                    p = model(xb).cpu().numpy().ravel()
+                preds.append(p)
+                trues.append(yb.cpu().numpy().ravel())
+        preds = np.concatenate(preds)
+        trues = np.concatenate(trues)
+        return preds, trues
 
-# Test predictions visualization
-recent_range = min(500, len(test_actual_original))
-if len(test_actual_original) > 0:
-    plot_results(
-        test_actual_original[-recent_range:], 
-        test_pred_original[-recent_range:],
-        f"Test Data - Actual vs Predicted (Last {recent_range} hours)"
-    )
+    train_pred_scaled, train_true_scaled = predict_dataset(model, train_loader, device)
+    val_pred_scaled, val_true_scaled = predict_dataset(model, val_loader, device)
+    test_pred_scaled, test_true_scaled = predict_dataset(model, test_loader, device)
 
-# Future forecast visualization
-plt.figure(figsize=(16, 8))
-plt.plot(future_predictions, linewidth=1.5, color='blue', alpha=0.8)
-plt.title(f'Electricity Consumption Forecast ({FORECAST_HORIZON//24:.0f} Days / {FORECAST_HORIZON} Hours)', 
-          fontsize=16)
-plt.xlabel('Hours from Now', fontsize=12)
-plt.ylabel('Consumption (kWh)', fontsize=12)
-plt.grid(True, alpha=0.3)
+    # inverse scale
+    train_pred = scaler.inverse_transform(train_pred_scaled.reshape(-1,1)).flatten()
+    val_pred = scaler.inverse_transform(val_pred_scaled.reshape(-1,1)).flatten()
+    test_pred = scaler.inverse_transform(test_pred_scaled.reshape(-1,1)).flatten()
 
-# Add time period markers
-if FORECAST_HORIZON >= 168:  # If forecasting at least a week
-    for week in range(int(FORECAST_HORIZON/168) + 1):
-        plt.axvline(x=week*168, color='red', linestyle='--', alpha=0.6, linewidth=1)
-        if week < int(FORECAST_HORIZON/168):
-            plt.text(week*168 + 84, plt.ylim()[1]*0.95, f'Week {week+1}', 
-                    ha='center', va='top', fontweight='bold')
+    train_true = scaler.inverse_transform(train_true_scaled.reshape(-1,1)).flatten()
+    val_true = scaler.inverse_transform(val_true_scaled.reshape(-1,1)).flatten()
+    test_true = scaler.inverse_transform(test_true_scaled.reshape(-1,1)).flatten()
 
-plt.tight_layout()
-plt.show()
+    train_metrics = calculate_metrics(train_true, train_pred, "Training")
+    val_metrics = calculate_metrics(val_true, val_pred, "Validation")
+    test_metrics = calculate_metrics(test_true, test_pred, "Test")
 
-# 8. Save comprehensive results
-print(f"\n8. Saving comprehensive results...")
+    # Forecast future
+    print(f"\nGenerating {FORECAST_HORIZON//24} day forecast ({FORECAST_HORIZON} hours)...")
+    last_sequence = scaled_consumption[-SEQUENCE_LENGTH:]
+    future_predictions = forecast_future(model, last_sequence, FORECAST_HORIZON, scaler, device)
 
-# Save forecast
-forecast_df.to_csv(f'electricity_forecast_{FORECAST_HORIZON//24}days.csv', index=False)
-print(f"Forecast saved to 'electricity_forecast_{FORECAST_HORIZON//24}days.csv'")
+    last_date = df['DateTime'].iloc[-1]
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(hours=1), periods=FORECAST_HORIZON, freq='H')
+    forecast_df = pd.DataFrame({'DateTime': future_dates, 'predicted_consumption': future_predictions})
+    forecast_csv = f'electricity_forecast_{FORECAST_HORIZON//24}days.csv'
+    forecast_df.to_csv(forecast_csv, index=False)
+    print("Forecast saved to", forecast_csv)
 
-# Save model
-model.save('electricity_complex_lstm_model_final.h5')
-print("Final model saved to 'electricity_complex_lstm_model_final.h5'")
-print("Best model saved to 'best_electricity_complex_lstm_model.h5' (recommended)")
+    # Plots: training history
+    plt.figure(figsize=(12,6))
+    plt.plot(history['train_loss'], label='train_loss')
+    plt.plot(history['val_loss'], label='val_loss')
+    plt.title('Training / Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
 
-# Save training history
-history_df = pd.DataFrame(history.history)
-history_df.to_csv('training_history.csv', index=False)
-print("Training history saved to 'training_history.csv'")
+    # Test results visualization
+    recent_range = min(500, len(test_true))
+    if len(test_true) > 0:
+        plt.figure(figsize=(14,5))
+        plt.plot(test_true[-recent_range:], label='Actual', linewidth=1)
+        plt.plot(test_pred[-recent_range:], label='Predicted', linewidth=1)
+        plt.title(f"Test Data - Actual vs Predicted (Last {recent_range} hours)")
+        plt.xlabel('Time Steps')
+        plt.ylabel('Consumption (kWh)')
+        plt.legend()
+        plt.grid(True)
+        plt.show()
 
-# Save metrics
-metrics_summary = {
-    'Dataset': ['Training', 'Validation', 'Test'],
-    'MAE': [train_metrics['MAE'], val_metrics['MAE'], test_metrics['MAE']],
-    'RMSE': [train_metrics['RMSE'], val_metrics['RMSE'], test_metrics['RMSE']],
-    'MAPE': [train_metrics['MAPE'], val_metrics['MAPE'], test_metrics['MAPE']],
-    'R2': [train_metrics['R2'], val_metrics['R2'], test_metrics['R2']]
-}
-pd.DataFrame(metrics_summary).to_csv('model_metrics.csv', index=False)
-print("Model metrics saved to 'model_metrics.csv'")
+    # Future forecast plot
+    plt.figure(figsize=(14,5))
+    plt.plot(future_predictions, linewidth=1.5, alpha=0.8)
+    plt.title(f'Electricity Consumption Forecast ({FORECAST_HORIZON//24:.0f} Days / {FORECAST_HORIZON} Hours)')
+    plt.xlabel('Hours from Now')
+    plt.ylabel('Consumption (kWh)')
+    plt.grid(True)
+    if FORECAST_HORIZON >= 168:
+        for week in range(int(FORECAST_HORIZON/168) + 1):
+            plt.axvline(x=week*168, color='red', linestyle='--', alpha=0.6, linewidth=1)
+            if week < int(FORECAST_HORIZON/168):
+                plt.text(week*168 + 84, plt.ylim()[1]*0.95, f'Week {week+1}', ha='center', va='top', fontweight='bold')
+    plt.tight_layout()
+    plt.show()
 
-print(f"\n=== Advanced LSTM Forecasting Complete ===")
-print(f"Configuration Used:")
-print(f"  • Input: {CONFIG['INPUT_WEEKS']} weeks ({SEQUENCE_LENGTH} hours)")
-print(f"  • Output: {CONFIG['OUTPUT_WEEKS']} weeks ({FORECAST_HORIZON} hours)")
-print(f"  • LSTM Units: {CONFIG['LSTM_UNITS']}")
-print(f"  • Dropout Rate: {CONFIG['DROPOUT_RATE']}")
-print(f"  • Epochs Trained: {epochs_trained}")
-
-print(f"\nFiles Generated:")
-print(f"  • best_electricity_complex_lstm_model.h5 (BEST MODEL)")
-print(f"  • electricity_complex_lstm_model_final.h5")
-print(f"  • electricity_forecast_{FORECAST_HORIZON//24}days.csv")
-print(f"  • training_history.csv")
-print(f"  • model_metrics.csv")
-
-print(f"\nModel Performance Summary:")
-print(f"  • Test MAE: {test_metrics['MAE']:.2f} kWh")
-print(f"  • Test RMSE: {test_metrics['RMSE']:.2f} kWh")  
-print(f"  • Test R²: {test_metrics['R2']:.4f}")
-
-# Show forecast sample
-print(f"\nForecast Sample (first 24 hours):")
-print(forecast_df.head(24)[['DateTime', 'predicted_consumption']].round(2).to_string(index=False))
+    # Save history / metrics
+    pd.DataFrame(history).to_csv('training_history.csv', index=False)
+    metrics_summary = {
+        'Dataset': ['Training', 'Validation', 'Test'],
+        'MAE': [train_metrics['MAE'], val_metrics['MAE'], test_metrics['MAE']],
+        'RMSE': [train_metrics['RMSE'], val_metrics['RMSE'], test_metrics['RMSE']],
+        'MAPE': [train_metrics['MAPE'], val_metrics['MAPE'], test_metrics['MAPE']],
+        'R2': [train_metrics['R2'], val_metrics['R2'], test_metrics['R2']]
+    }
+    pd.DataFrame(metrics_summary).to_csv('model_metrics.csv', index=False)
+    print("\n=== Completed ===")
+    print(f"Files Generated:\n - {final_model_path}\n - {forecast_csv}\n - training_history.csv\n - model_metrics.csv")
+    print("\nForecast Sample (first 24 hours):")
+    print(forecast_df.head(24).round(2).to_string(index=False))
