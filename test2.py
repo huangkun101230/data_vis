@@ -156,72 +156,58 @@ class SequenceDataset(Dataset):
 # ---------------------------
 # Model Definition
 # ---------------------------
-class ComplexLSTM(nn.Module):
-    def __init__(self, seq_len, lstm_units=64, dropout_rate=0.2, cpu_fallback=False):
-        super().__init__()
-        # reduce size for CPU fallback
-        if cpu_fallback and not torch.cuda.is_available():
-            lstm_units = min(lstm_units, 64)
-            dropout_rate = min(dropout_rate, 0.2)
+class SimpleRNNDepth(nn.Module):
+    def __init__(self, in_channels=3, hidden_size=128):
+        super(SimpleRNNDepth, self).__init__()
 
-        # We'll create stacked LSTMs with batch norm in between.
-        self.lstm1 = nn.LSTM(input_size=1, hidden_size=lstm_units, batch_first=True)
-        self.bn1 = nn.BatchNorm1d(seq_len)  # batchnorm over sequence dim: we will transpose appropriately
-        self.dropout1 = nn.Dropout(dropout_rate)
+        # Feature extractor (lightweight CNN)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=5, stride=2, padding=2),  # H/2
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),           # H/4
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),          # H/8
+            nn.ReLU(inplace=True)
+        )
 
-        self.lstm2 = nn.LSTM(input_size=lstm_units, hidden_size=lstm_units // 2, batch_first=True)
-        self.bn2 = nn.BatchNorm1d(seq_len)
-        self.dropout2 = nn.Dropout(dropout_rate)
+        # Collapse spatial dims for RNN
+        self.flatten = nn.Flatten(start_dim=2)
 
-        self.lstm3 = nn.LSTM(input_size=lstm_units // 2, hidden_size=lstm_units // 4, batch_first=True)
-        # final BN not over sequence (we'll BN the last timestep features)
-        self.bn3 = nn.BatchNorm1d(lstm_units // 4)
-        self.dropout3 = nn.Dropout(dropout_rate)
+        # Simple RNN over time
+        self.rnn = nn.RNN(
+            input_size=128 *  (32) * (64),  # depends on input size
+            hidden_size=hidden_size,
+            batch_first=True
+        )
 
-        self.fc1 = nn.Linear(lstm_units // 4, 64)
-        self.drop_fc1 = nn.Dropout(dropout_rate)
-        self.fc2 = nn.Linear(64, 32)
-        self.drop_fc2 = nn.Dropout(dropout_rate / 2)
-        self.fc3 = nn.Linear(32, 16)
-        self.out = nn.Linear(16, 1)
-
-        self.relu = nn.ReLU()
+        # Decoder to predict depth
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_size, 512),
+            nn.ReLU(inplace=True),
+            nn.Linear(512, 1 * 256 * 512)  # final depth map size (adjust as needed)
+        )
 
     def forward(self, x):
-        # x shape: (batch, seq_len, 1)
-        b, seq_len, _ = x.shape
+        # x: [B, T, C, H, W]
+        B, T, C, H, W = x.shape
+        features = []
 
-        # LSTM1
-        out, _ = self.lstm1(x)  # (b, seq_len, hidden)
-        # BatchNorm1d expects (b, features, seq_len) or (b, seq_len, features) depending usage.
-        # We'll transpose to (b, seq_len, features) -> BN over features for each timestep by using BN1d on last dim requires permute.
-        # Simpler: apply BN over features by reshaping to (b*seq_len, features), then back.
-        out_reshaped = out.contiguous().view(-1, out.size(2))
-        out_bn = self.bn1(out_reshaped)
-        out = out_bn.view(b, seq_len, -1)
-        out = self.dropout1(out)
+        for t in range(T):
+            f = self.encoder(x[:, t])  # [B, 128, H/8, W/8]
+            f = self.flatten(f)        # [B, feature_dim]
+            features.append(f)
 
-        # LSTM2
-        out, _ = self.lstm2(out)
-        out_reshaped = out.contiguous().view(-1, out.size(2))
-        out_bn = self.bn2(out_reshaped)
-        out = out_bn.view(b, seq_len, -1)
-        out = self.dropout2(out)
+        features = torch.stack(features, dim=1)  # [B, T, feature_dim]
 
-        # LSTM3 -> keep only last timestep
-        out, _ = self.lstm3(out)  # (b, seq_len, hidden3)
-        last = out[:, -1, :]  # (b, hidden3)
-        last_bn = self.bn3(last)
-        last = self.dropout3(last_bn)
+        rnn_out, _ = self.rnn(features)          # [B, T, hidden_size]
 
-        # Dense stack
-        x = self.relu(self.fc1(last))
-        x = self.drop_fc1(x)
-        x = self.relu(self.fc2(x))
-        x = self.drop_fc2(x)
-        x = self.relu(self.fc3(x))
-        out = self.out(x).float()  # ensure float32
-        return out
+        depth_maps = []
+        for t in range(T):
+            d = self.decoder(rnn_out[:, t])      # [B, H*W]
+            d = d.view(B, 1, 256, 512)           # reshape to depth map
+            depth_maps.append(d)
+
+        return torch.stack(depth_maps, dim=1)    # [B, T, 1, H, W]
 
 # ---------------------------
 # Training Utilities
