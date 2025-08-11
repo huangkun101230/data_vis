@@ -34,7 +34,7 @@ class ConsumptionDataset(Dataset):
         df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
         # Features: time encodings + consumption
-        features = [""hour_cos", "dow_cos", "month_cos", "Consumption"]
+        features = ["hour_cos", "dow_cos", "month_cos", "Consumption"]
         self.data = df[features].values.astype(np.float32)
 
     def __len__(self):
