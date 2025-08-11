@@ -400,13 +400,8 @@ if __name__ == '__main__':
     model = SimpleRNNDepth(in_channels=3, hidden_size=128)
     print(model)
 
-    try:
-        model, history = train_model(model, train_loader, val_loader, CONFIG, device)
-    except Exception as e:
-        print("Training error:", e)
-        print("Attempting CPU fallback model with smaller size...")
-        model = ComplexLSTM(SEQUENCE_LENGTH, lstm_units=min(CONFIG['LSTM_UNITS'], 64), dropout_rate=min(CONFIG['DROPOUT_RATE'], 0.2))
-        model, history = train_model(model, train_loader, val_loader, CONFIG, device)
+    model, history = train_model(model, train_loader, val_loader, CONFIG, device)
+
 
     # Save final model
     final_model_path = os.path.join(CONFIG['MODEL_DIR'], 'electricity_complex_lstm_model_final.pt')
