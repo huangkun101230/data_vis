@@ -123,7 +123,7 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
 
-    model = SimpleRNN(input_size=7, hidden_size=HIDDEN_SIZE, pred_length=PRED_LENGTH).to(DEVICE)
+    model = SimpleRNN(input_size=4, hidden_size=HIDDEN_SIZE, pred_length=PRED_LENGTH).to(DEVICE)
 
     model = train_model(model, train_loader, val_loader, EPOCHS, LR, DEVICE)
 
