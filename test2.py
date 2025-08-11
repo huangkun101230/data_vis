@@ -197,14 +197,14 @@ class ComplexLSTM(nn.Module):
         # We'll transpose to (b, seq_len, features) -> BN over features for each timestep by using BN1d on last dim requires permute.
         # Simpler: apply BN over features by reshaping to (b*seq_len, features), then back.
         out_reshaped = out.contiguous().view(-1, out.size(2))
-        out_bn = nn.functional.batch_norm(out_reshaped, running_mean=None, running_var=None, training=self.training)
+        out_bn = self.bn1(out_reshaped)
         out = out_bn.view(b, seq_len, -1)
         out = self.dropout1(out)
 
         # LSTM2
         out, _ = self.lstm2(out)
         out_reshaped = out.contiguous().view(-1, out.size(2))
-        out_bn = nn.functional.batch_norm(out_reshaped, running_mean=None, running_var=None, training=self.training)
+        out_bn = self.bn2(out_reshaped)
         out = out_bn.view(b, seq_len, -1)
         out = self.dropout2(out)
 
