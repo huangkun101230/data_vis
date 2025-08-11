@@ -34,8 +34,12 @@ class ConsumptionDataset(Dataset):
         df["dow_cos"] = np.cos(2 * np.pi * df["dayofweek"] / 7)
         df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
+        scaler_con = StandardScaler()
+        df["consumption_scaled"] = scaler_con.fit_transform(df["Consumption"].reshape(-1, 1))
+        print(df.head())
+        exit()
         # Features: time encodings + consumption
-        features = ["hour_cos", "dow_cos", "month_cos", "Consumption"]
+        features = ["hour_cos", "dow_cos", "month_cos", "consumption_scaled"]
         self.data = df[features].values.astype(np.float32)
 
     def __len__(self):
@@ -64,7 +68,7 @@ class SimpleRNN(nn.Module):
 # --------------------
 # TRAIN FUNCTION
 # --------------------
-def train_model(model, train_loader, val_loader, epochs, lr, device, scaler_y):
+def train_model(model, train_loader, val_loader, epochs, lr, device):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     record = 999999999999
@@ -73,12 +77,7 @@ def train_model(model, train_loader, val_loader, epochs, lr, device, scaler_y):
         model.train()
         train_loss = 0
         for xb, yb in train_loader:
-            print(xb.shape)
             xb, yb = xb.to(device), yb.to(device)
-            xb = scaler_y.fit_transform(xb.reshape(-1, 1))
-            print(xb.shape)
-            yb = scaler_y.transform(yb.reshape(-1, 1))
-            exit()
             optimizer.zero_grad()
             preds = model(xb)
             loss = criterion(preds, yb)
@@ -130,7 +129,7 @@ if __name__ == "__main__":
 
     model = SimpleRNN(input_size=4, hidden_size=HIDDEN_SIZE, pred_length=PRED_LENGTH).to(DEVICE)
 
-    model = train_model(model, train_loader, val_loader, EPOCHS, LR, DEVICE, scaler_y = StandardScaler())
+    model = train_model(model, train_loader, val_loader, EPOCHS, LR, DEVICE)
 
     # torch.save(model.state_dict(), "simple_rnn_consumption.pth")
     # print("Model saved as simple_rnn_consumption.pth")
