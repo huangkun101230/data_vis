@@ -35,7 +35,7 @@ class ConsumptionDataset(Dataset):
         df["month_cos"] = np.cos(2 * np.pi * df["month"] / 12)
 
         scaler_con = StandardScaler()
-        df["consumption_scaled"] = scaler_con.fit_transform(df["Consumption"].reshape(-1, 1))
+        df["consumption_scaled"] = scaler_con.fit_transform(df.loc["Consumption"].reshape(-1, 1))
         print(df.head())
         exit()
         # Features: time encodings + consumption
